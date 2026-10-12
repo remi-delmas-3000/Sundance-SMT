@@ -729,10 +729,49 @@ impl Egraph {
             self.display_term(u),
             self.display_term(v)
         );
-        self.leastcommonancestor_helper(u, v, 0)
+        // Each pair is explained once: the explanation of a congruence edge
+        // is the explanations of its argument pairs, and those sub-proofs are
+        // shared across the proof DAG. Recursing into them without a memo
+        // explored the DAG as a tree (85% of the samples 27 levels deep on
+        // PagedBetreeRefinement_v.25). Z3's explain_eq marks each pair.
+        let mut done: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
+        let mut work: Vec<(u32, u32)> = vec![(u, v)];
+        let mut final_proof: Vec<(u32, u32)> = Vec::new();
+        let mut in_proof: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
+        let mut first = true;
+        while let Some((a, b)) = work.pop() {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if !done.insert(key) {
+                continue;
+            }
+            match self.leastcommonancestor_helper(a, b, 0) {
+                None if first => return None,
+                None => {}
+                Some((equalities, pairs)) => {
+                    for e in equalities {
+                        if in_proof.insert(e) {
+                            final_proof.push(e);
+                        }
+                    }
+                    work.extend(pairs);
+                }
+            }
+            first = false;
+        }
+        Some(final_proof)
     }
 
-    fn leastcommonancestor_helper(&self, u: u32, v: u32, indent: usize) -> Option<Vec<(u32, u32)>> {
+    /// The path explanation of `u = v`: the asserted equalities along the
+    /// proof-forest paths to their least common ancestor, and the argument
+    /// pairs of the congruence edges on those paths, which the caller
+    /// explains in turn. `None` when `u` and `v` are not in one class.
+    #[allow(clippy::type_complexity)]
+    fn leastcommonancestor_helper(
+        &self,
+        u: u32,
+        v: u32,
+        indent: usize,
+    ) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
         debug_println!(
             20,
             indent,
@@ -830,14 +869,8 @@ impl Egraph {
             }
         }
 
-        for pairs in proof_congruences {
-            for &(a, b) in pairs {
-                if let Some(subproof) = self.leastcommonancestor_helper(a, b, indent + 1) {
-                    final_proof.extend(subproof);
-                }
-            }
-        }
-        Some(final_proof)
+        let pending: Vec<(u32, u32)> = proof_congruences.into_iter().flatten().copied().collect();
+        Some((final_proof, pending))
     }
 
     /// Assert t1 = t2 at the current decision level.
