@@ -199,11 +199,11 @@ impl fmt::Display for Egraph {
 /// The egraph datastructure that keeps track of terms, equalities and parents
 pub struct Egraph {
     /// Next ID to assign
-    next_id: u32,
+    pub(super) next_id: u32,
     /// Internal term representation per term ID
-    terms: Vec<TermSlot>,
+    pub(super) terms: Vec<TermSlot>,
     /// Compiled patterns for e-matching (indexed by PatternId)
-    compiled_patterns: Vec<Pattern>,
+    pub(super) compiled_patterns: Vec<Pattern>,
     /// map from vertices (u32) -> ProofForestEdge
     proof_forest: Vec<ProofForestEdge>,
     /// keeps track of a stack of "edges" to backtrack on
@@ -215,9 +215,9 @@ pub struct Egraph {
     /// mapping from levels -> corresponding hash
     predecessor_level: Vec<u32>,
     /// map from functions (String) -> terms of this function
-    function_maps: DeterministicHashMap<String, Vec<(u32, Vec<u32>)>>,
+    pub(super) function_maps: DeterministicHashMap<String, Vec<(u32, Vec<u32>)>>,
     /// the current decision level of the SAT solver, useful to keep track for backtracking
-    decision_level: usize,
+    pub(super) decision_level: usize,
     /// keeps track of terms created by quantifier instantiation and their predecessors.
     /// Inner map: parent term id -> decision level at which the (child, parent) pair
     /// was registered. Used by `backtrack_to` to skip re-registering entries that
@@ -225,8 +225,8 @@ pub struct Egraph {
     /// valid at that level and don't need refreshing).
     /// Per decision level: the (child, parent) pairs registered at that
     /// level, so a backtrack visits only the levels it undoes instead of
-    /// cloning and scanning every entry (18% of the samples on
-    /// PagedBetreeRefinement_v.25 before this change).
+    /// cloning and scanning every entry (which was 18% of the profile
+    /// samples on PagedBetreeRefinement_v.25).
     predecessors_created_by_quantifiers: Vec<Vec<(u32, u32)>>,
     /// if a quantifier instantiates (f t) and t = s, then we want to add (f.uid(), "f", [t.uid()]).
     /// Value is the decision level at which the term was registered; entries added
@@ -247,6 +247,19 @@ pub struct Egraph {
     arithmetic_merge_queue: Vec<(u32, u32)>,
     /// Accumulated egraph statistics.
     pub(crate) stats: EgraphStats,
+    /// Relevancy (`relevancy.rs`).
+    pub(super) rel: super::relevancy::Relevancy,
+    /// Incremental matching (`relevancy.rs`).
+    pub(super) incr: super::relevancy::Incremental,
+    /// The `true` / `false` constants, by the name they are registered with.
+    pub(super) true_id: Option<u32>,
+    pub(super) false_id: Option<u32>,
+    /// Circular class lists: `next_in_class[t]` is the next member of `t`'s
+    /// class (`u32::MAX` until `t` takes part in a union, meaning a singleton).
+    /// A union swaps the two roots' links, which splices the two cycles; the
+    /// same swap undoes it, so `union_trail` replays in reverse on backtrack.
+    pub(super) next_in_class: Vec<u32>,
+    pub(super) union_trail: Vec<(usize, u32, u32)>,
 }
 
 /// Statistics accumulated by the egraph.
@@ -259,6 +272,14 @@ pub(crate) struct EgraphStats {
 impl Default for Egraph {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// Trail-boundary profile print, mirroring the semper backend's teardown print.
+impl Drop for Egraph {
+    fn drop(&mut self) {
+        crate::egraphs::trail_prof::report("basic");
+        self.rel_report();
     }
 }
 
@@ -288,6 +309,12 @@ impl Egraph {
             incremental_arithmetic: false,
             arithmetic_merge_queue: Vec::new(),
             stats: EgraphStats::default(),
+            rel: super::relevancy::Relevancy::new(super::relevancy::rel_enabled()),
+            incr: Default::default(),
+            true_id: None,
+            false_id: None,
+            next_in_class: Vec::new(),
+            union_trail: Vec::new(),
         }
     }
 
@@ -339,6 +366,7 @@ impl Egraph {
             op: op.clone(),
             children: Children::from_slice(children),
         });
+        self.rel_register(id, &op, children);
 
         self.proof_forest[id as usize] = ProofForestEdge::Root {
             size: 1,
@@ -465,7 +493,7 @@ impl Egraph {
         )
     }
 
-    fn find(&self, x: u32) -> u32 {
+    pub(super) fn find(&self, x: u32) -> u32 {
         let p: &ProofForestEdge = &self.proof_forest[x as usize];
         match p {
             ProofForestEdge::Root { .. } => x,
@@ -742,8 +770,9 @@ impl Egraph {
         // Each pair is explained once: the explanation of a congruence edge
         // is the explanations of its argument pairs, and those sub-proofs are
         // shared across the proof DAG. Recursing into them without a memo
-        // explored the DAG as a tree (85% of the samples 27 levels deep on
-        // PagedBetreeRefinement_v.25). Z3's explain_eq marks each pair.
+        // explored the DAG as a tree: on PagedBetreeRefinement_v.25, 85% of
+        // the samples were 27 levels deep in this recursion. Z3's
+        // `explain_eq` marks each pair (`m_todo` with a mark), as here.
         let mut done: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
         let mut work: Vec<(u32, u32)> = vec![(u, v)];
         let mut final_proof: Vec<(u32, u32)> = Vec::new();
@@ -888,6 +917,7 @@ impl Egraph {
     /// Performs congruence closure. Returns a conflict if a disequality is violated.
     fn assert_equal(&mut self, t1: u32, t2: u32) -> EgraphResult<u32> {
         let level = self.decision_level;
+        self.rel_seed_root_if_boolean(t1, t2);
         let proof_parent = ProofForestEdge::Equality {
             size: 0,
             term: Some((t1, t2)),
@@ -905,6 +935,7 @@ impl Egraph {
     /// Returns a conflict if t1 and t2 are already in the same equivalence class.
     fn assert_disequal(&mut self, t1: u32, t2: u32, diseq_lit: i32) -> EgraphResult<u32> {
         let level = self.decision_level;
+        self.rel_seed_root_if_boolean(t1, t2);
         if let Some(equalities) = self.leastcommonancestor(t1, t2) {
             // diseq_lit is None: the disequality being asserted is implicit in the
             // conflict (the caller reconstructs it from the assertion context).
@@ -952,6 +983,9 @@ impl Egraph {
                 self.proof_forest_backtrack_stack.pop().unwrap();
             self.proof_forest_backtrack(backtrack_equality, y, y_root);
         }
+        // Class lists and relevancy marks above `level`, before the
+        // congruence re-merges below push new entries at `level`.
+        self.rel_backtrack(level);
 
         // Replay sig_trail in reverse AFTER UF is restored.
         // Use the stored key directly — recomputing from find() would give the wrong key.
@@ -1286,6 +1320,7 @@ impl Egraph {
             self.display_term(y_root)
         );
         self.make_root(y, proof_parent);
+        self.rel_after_union(x_root, y_root, level);
 
         // Early conflict check: x_root's existing disequalities may already be
         // violated now that y's class has been merged in.
@@ -1497,10 +1532,14 @@ impl Egraph {
     /// satisfying substitutions. Returns variable name → matched term ID.
     /// Match a list of (pattern, ground_hint) pairs against the egraph.
     /// Returns all valid variable assignments.
-    fn match_patterns(
+    /// `filter`: restrict the first pair's root candidates to the round's
+    /// incremental candidates (`relevancy.rs`); the remaining pairs join
+    /// unfiltered.
+    pub(super) fn match_patterns(
         &mut self,
         assignment: &mut DeterministicHashMap<Local, u32>,
         pattern_term_pairs: &[(PatternId, Option<u32>)],
+        filter: bool,
     ) -> Vec<DeterministicHashMap<Local, u32>> {
         if pattern_term_pairs.is_empty() {
             return vec![assignment.clone()];
@@ -1512,6 +1551,7 @@ impl Egraph {
             &pattern,
             ground_hint,
             &pattern_term_pairs[1..].to_vec(),
+            filter,
         )
     }
 
@@ -1522,6 +1562,7 @@ impl Egraph {
         pattern: &Pattern,
         ground_hint: Option<u32>,
         remaining: &Vec<(PatternId, Option<u32>)>,
+        filter: bool,
     ) -> Vec<DeterministicHashMap<Local, u32>> {
         match pattern {
             Pattern::Var(name) => {
@@ -1530,35 +1571,39 @@ impl Egraph {
                     None => {
                         assignment.insert(name.clone(), ground);
 
-                        self.match_patterns(assignment, remaining)
+                        self.match_patterns(assignment, remaining, false)
                     }
                     Some(v) if self.find(*v) == self.find(ground) => {
-                        self.match_patterns(assignment, remaining)
+                        self.match_patterns(assignment, remaining, false)
                     }
                     Some(_) => vec![],
                 }
             }
             Pattern::Ground(egraph_id) => match ground_hint {
                 Some(ground) if self.find(*egraph_id) == self.find(ground) => {
-                    self.match_patterns(assignment, remaining)
+                    self.match_patterns(assignment, remaining, false)
                 }
-                None => self.match_patterns(assignment, remaining),
+                None => self.match_patterns(assignment, remaining, false),
                 _ => vec![],
             },
             Pattern::App(op, sub_patterns) => {
                 let func_name = op.to_function_map_key();
+                let depth = super::relevancy::pattern_depth(pattern);
                 self.find_assignments_on_pattern(
                     ground_hint,
                     &func_name,
                     sub_patterns,
                     remaining,
                     assignment,
+                    filter.then_some(depth),
                 )
             }
         }
     }
 
     /// Find all function applications matching the given op, then recurse into sub-patterns.
+    /// `incr_depth`: `Some(d)` restricts the candidates to the round's
+    /// incremental candidates at or below depth `d`.
     fn find_assignments_on_pattern(
         &mut self,
         ground_hint: Option<u32>,
@@ -1566,10 +1611,23 @@ impl Egraph {
         sub_patterns: &[Pattern],
         remaining: &Vec<(PatternId, Option<u32>)>,
         assignment: &mut DeterministicHashMap<Local, u32>,
+        incr_depth: Option<u32>,
     ) -> Vec<DeterministicHashMap<Local, u32>> {
-        let function_terms = match self.function_maps.get(func_name) {
-            Some(terms) => terms.clone(),
-            None => return vec![],
+        let function_terms: Vec<(u32, Vec<u32>)> = match incr_depth {
+            Some(depth) => {
+                let all = self.function_maps.get(func_name).map_or(0, |v| v.len());
+                self.incr_candidates(func_name, depth, all)
+                    .into_iter()
+                    .filter_map(|t| match &self.terms[t as usize] {
+                        TermSlot::Term(e) => Some((t, e.children.as_slice().to_vec())),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            None => match self.function_maps.get(func_name) {
+                Some(terms) => terms.clone(),
+                None => return vec![],
+            },
         };
 
         let mut list_assignments = Vec::new();
@@ -1578,6 +1636,9 @@ impl Egraph {
 
         for (i, subterms) in function_terms {
             if subterms.len() != sub_patterns.len() {
+                continue;
+            }
+            if self.rel_shielded(i) {
                 continue;
             }
 
@@ -1611,7 +1672,7 @@ impl Egraph {
         remaining: &Vec<(PatternId, Option<u32>)>,
     ) -> Vec<DeterministicHashMap<Local, u32>> {
         if sub_patterns.is_empty() {
-            return self.match_patterns(assignment, remaining);
+            return self.match_patterns(assignment, remaining, false);
         }
         let pattern = &sub_patterns[0];
         let ground = ground_subterms[0];
@@ -1649,6 +1710,9 @@ impl Egraph {
 
                 for (i, subterms) in function_terms {
                     if subterms.len() != children.len() {
+                        continue;
+                    }
+                    if self.rel_shielded(i) {
                         continue;
                     }
                     let i_root = self.find(i);
@@ -1728,6 +1792,7 @@ impl EgraphTrait for Egraph {
 
     fn compile_pattern(&mut self, pattern: Pattern) -> PatternId {
         let id = self.compiled_patterns.len();
+        self.incr_compile_pattern(&pattern);
         self.compiled_patterns.push(pattern);
         id
     }
@@ -1770,6 +1835,7 @@ impl EgraphTrait for Egraph {
     }
 
     fn notify_new_decision_level(&mut self) {
+        let prof_t = crate::egraphs::trail_prof::enabled().then(std::time::Instant::now);
         assert!(
             self.arithmetic_merge_queue.is_empty(),
             "arithmetic queue must be drained before advancing decision level"
@@ -1780,6 +1846,9 @@ impl EgraphTrait for Egraph {
                 .resize(self.predecessor_level.len() * 2, 0);
         }
         self.predecessor_level[self.decision_level] = self.predecessor_hash;
+        if let Some(t) = prof_t {
+            crate::egraphs::trail_prof::record_level(t.elapsed().as_nanos() as u64);
+        }
     }
 
     fn assert_equal(&mut self, t1: Self::TermId, t2: Self::TermId) -> EgraphResult<Self::TermId> {
@@ -1811,12 +1880,55 @@ impl EgraphTrait for Egraph {
         &mut self,
         trigger_term_pairs: Vec<(PatternId, Option<Self::TermId>)>,
     ) -> Vec<DeterministicHashMap<Local, u32>> {
+        let filter = match trigger_term_pairs.first() {
+            Some(&(first, _)) => match self.incr_filter_for(first) {
+                None => return Vec::new(),
+                Some(f) => f,
+            },
+            None => false,
+        };
         let mut assignment = DeterministicHashMap::default();
-        self.match_patterns(&mut assignment, &trigger_term_pairs)
+        let matches = self.match_patterns(&mut assignment, &trigger_term_pairs, filter);
+        self.incr_record(&trigger_term_pairs, filter, &matches);
+        matches
+    }
+
+    fn note_instance_root(&mut self, term: Self::TermId) {
+        self.rel_note_instance_root(term);
+    }
+
+    fn note_assignment(&mut self, term: Self::TermId) {
+        self.rel_on_assignment(term);
+    }
+
+    fn begin_matching_round(&mut self) {
+        if super::relevancy::incr_match() {
+            self.incr_begin_round();
+        }
+    }
+
+    fn incremental_matching(&self) -> bool {
+        super::relevancy::incr_match()
+    }
+
+    fn is_term_relevant(&self, term: Self::TermId) -> bool {
+        self.rel_is_term_relevant(term)
+    }
+
+    fn set_relevancy_active(&mut self, active: bool) {
+        self.rel_set_active(active);
+    }
+
+    fn suggest_decision(&self) -> Option<(Self::TermId, bool)> {
+        self.rel_suggest_decision()
     }
 
     fn backtrack_to(&mut self, level: usize) {
-        self.backtrack_to(level)
+        let prof_t = crate::egraphs::trail_prof::enabled().then(std::time::Instant::now);
+        self.backtrack_to(level);
+        if let Some(t) = prof_t {
+            crate::egraphs::trail_prof::record_backtrack(t.elapsed().as_nanos() as u64);
+        }
     }
 
     fn make_decision(&self, _assignments: &[i32]) -> i32 {

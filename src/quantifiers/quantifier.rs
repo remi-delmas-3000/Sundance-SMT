@@ -420,6 +420,20 @@ pub(crate) fn instantiate_quantifiers(
             continue;
         }
 
+        // Z3 instantiates a quantifier only once its atom is relevant
+        // (`context::propagate_relevancy` queues a quantifier atom for the
+        // quantifier manager only when it is marked). The backend answers
+        // true outside relevancy-filtered rounds, so the complete-model round
+        // is never gated.
+        if let Some(&qeid) = solver_state.id_map.get_by_left(&quantifier.id)
+            && !solver_state.egraph.is_term_relevant(qeid)
+        {
+            if inst_trace() {
+                eprintln!("INST-QSKIP r={round} q={} eid={qeid}", quantifier.id);
+            }
+            continue;
+        }
+
         let triggers = &quantifier.triggers;
         if triggers.is_empty() {
             debug_println!(
@@ -431,7 +445,16 @@ pub(crate) fn instantiate_quantifiers(
         // note we consider patterns in a multipattern conjunctively and multipatterns in a trigger disjunctively
         for multipattern in triggers {
             let body = quantifier.body;
-            let rotations = 1;
+            // Under incremental matching the backend filters the first
+            // pattern's candidates to the classes changed since the previous
+            // round, so each pattern of a multipattern takes the first
+            // position in turn (the dedup below absorbs the repeats); one
+            // order otherwise.
+            let rotations = if solver_state.egraph.incremental_matching() {
+                multipattern.len()
+            } else {
+                1
+            };
             let mut list_assignments = Vec::new();
             for k in 0..rotations {
                 let first = multipattern[k];
@@ -675,6 +698,16 @@ fn process_deferred_skolemizations(
             check_for_function_bool(&reduced_skolem, solver_state, true, ddsmt, lazy_dt);
 
         solver_state.insert_predecessor(&reduced_skolem, None, None, true);
+        // A skolemization body is a relevancy root exactly as an instance body
+        // is: Z3 asserts the witness formula as part of a root clause, so its
+        // terms are relevant once it is true. Without the seed, the terms of
+        // a witness (`(apply f sk)` of a false `forall`) stayed irrelevant and
+        // the instances refuting it were never matched (Utils_v.5).
+        if std::env::var_os("SUNDANCE_REL_NO_SEED_SKOLEM").is_none()
+            && let Some(&eid) = solver_state.id_map.get_by_left(&reduced_skolem.uid())
+        {
+            solver_state.egraph.note_instance_root(eid);
+        }
 
         // Must do Tseitin *before* allocating the skolem literal — see comment on instantiation path
         let clauses = reduced_skolem.cnf_tseitin(solver_state);
@@ -776,6 +809,11 @@ fn process_deferred_instantiations(
         tag_generation(solver_state, &nnf_term, generation);
 
         solver_state.insert_predecessor(&nnf_term, None, None, true);
+        // The instance body is a relevancy root in Z3 (asserted as a root
+        // clause with relevancy watches); tell the backend which term it is.
+        if let Some(&eid) = solver_state.id_map.get_by_left(&nnf_term.uid()) {
+            solver_state.egraph.note_instance_root(eid);
+        }
 
         let cnf_term = nnf_term.cnf_tseitin(solver_state);
 

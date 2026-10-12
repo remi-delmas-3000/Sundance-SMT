@@ -130,6 +130,7 @@ pub struct SolverState {
 
     /// Tracks quantifier instantiations to avoid duplicates.
     pub added_instantiations: HashMap<u64, HashSet<DeterministicHashMap<Local, Term>>>,
+
     /// Generation of each term created by a quantifier instance, by solver
     /// uid (Z3's enode generation): the instance's generation, itself one
     /// more than the largest generation among its bindings. A term absent
@@ -137,6 +138,7 @@ pub struct SolverState {
     /// generation of its first creation. Read by the instantiation bound
     /// (`SUNDANCE_QI_MAX_GEN`).
     pub term_generation: HashMap<u64, u32>,
+
     /// Matches held back by the generation bound, and their keys (quantifier
     /// id, substitution) so a match is held once.
     pub gen_deferred: Vec<crate::quantifiers::quantifier::GenDeferred>,
@@ -736,6 +738,7 @@ pub fn process_assignment(
             }
             return Some(vec![(model_terms, Theory::QfUf)]);
         }
+        solver_state.egraph.note_assignment(egraph_t);
     }
 
     if let Some(t) = solver_state.cnf_cache.var_map_reverse.get(&-lit) {
@@ -760,6 +763,7 @@ pub fn process_assignment(
             }
             return Some(vec![(model_terms, Theory::QfUf)]);
         };
+        solver_state.egraph.note_assignment(egraph_t);
     }
 
     debug_println!("Finished union to True/False");
