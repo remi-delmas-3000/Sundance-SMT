@@ -753,8 +753,9 @@ impl<'a> ExternalPropagator for CustomExternalPropagator<'a> {
                 }
 
                 for conflict in &conflicts {
-                    // Walk the proof path backward, pick the last probe-merged
-                    // pair whose trichotomy hasn't been emitted yet. Emit at
+                    // Scan the explanation in reverse enumeration order for a
+                    // probe pair whose trichotomy has not been emitted yet.
+                    // Enumeration order does not encode probe chronology. Emit at
                     // most one trichotomy per conflict; other probed pairs
                     // fall back on `make_eq` allocating a bare eq lit.
                     let fresh_probe_pair = conflict.equalities.iter().rev().find_map(|&(a, b)| {

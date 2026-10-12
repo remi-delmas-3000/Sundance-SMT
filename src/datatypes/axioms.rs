@@ -472,3 +472,60 @@ pub fn learn_or_not_term_tester_term(
     debug_println!(12, 2, "This gives us {:?}", tester_cnf);
     tester_cnf
 }
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+    use yaspar_ir::ast::{Context, Typecheck, alg};
+    use yaspar_ir::untyped::UntypedAst;
+
+    #[test]
+    fn tester_axiom_registers_normalized_gate() {
+        let mut context = Context::default();
+        let commands = UntypedAst
+            .parse_script_str(
+                "(set-logic ALL) (declare-datatype Color ((red) (blue)))
+             (declare-const x Color) (assert ((_ is red) x)) (assert ((_ is blue) x))",
+            )
+            .unwrap()
+            .type_check(&mut context)
+            .unwrap();
+        let testers: Vec<Term> = commands
+            .iter()
+            .filter_map(|c| match c.repr() {
+                alg::Command::Assert(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut state = SolverState::new(context, true, false, false, false);
+        let t = state.get_true();
+        let f = state.get_false();
+        state.register_bool_constants(&t, &f);
+        // A negative tester makes the raw axiom contain a double negation.
+        // Its NNF has a different UID even without AC canonicalization.
+        let negative_tester = state.not(testers[0].clone());
+        let not_negative = state.not(negative_tester.clone());
+        let not_blue = state.not(testers[1].clone());
+        let raw = state.or(vec![not_blue, not_negative]);
+        let normalized = raw.nnf(&mut state);
+        assert_ne!(
+            raw.uid(),
+            normalized.uid(),
+            "regression must exercise different gates"
+        );
+        let clauses =
+            learn_or_not_term_tester_term(&mut state, negative_tester, testers[1].clone(), true);
+        let gate = state.get_lit_from_term(&normalized);
+        assert_eq!(clauses.last(), Some(&vec![gate]));
+        assert!(state.id_map.contains_left(&normalized.uid()));
+        // Every emitted literal must map to a registered term, including the
+        // normalized top gate that the old raw-registration path omitted.
+        for lit in clauses.iter().flatten() {
+            let uid = state.cnf_cache.var_map_reverse[&lit.abs()];
+            assert!(
+                state.id_map.contains_left(&uid),
+                "unregistered literal {lit}"
+            );
+        }
+    }
+}

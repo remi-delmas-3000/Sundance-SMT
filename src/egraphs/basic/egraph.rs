@@ -22,6 +22,18 @@ type SigKey = (CanonicalOp, Children);
 /// (level, key, term_id, was_inserted)
 type SigTrailEntry = (usize, SigKey, u32, bool);
 
+/// One proof-forest path, before expanding its congruence dependencies.
+struct PathExplanation {
+    equalities: Vec<(u32, u32)>,
+    congruences: Vec<(u32, u32)>,
+}
+
+/// Explicit DFS frames keep active dependencies distinct from completed ones.
+enum ExplanationStep {
+    Enter(u32, u32),
+    Finish((u32, u32)),
+}
+
 impl fmt::Display for Egraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "=== Egraph Summary ===")?;
@@ -744,30 +756,51 @@ impl Egraph {
         // shared across the proof DAG. Recursing into them without a memo
         // explored the DAG as a tree (85% of the samples 27 levels deep on
         // PagedBetreeRefinement_v.25). Z3's explain_eq marks each pair.
-        let mut done: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
-        let mut work: Vec<(u32, u32)> = vec![(u, v)];
-        let mut final_proof: Vec<(u32, u32)> = Vec::new();
-        let mut in_proof: FastDeterministicHashSet<(u32, u32)> =
-            FastDeterministicHashSet::default();
-        let mut first = true;
-        while let Some((a, b)) = work.pop() {
+        let mut done = FastDeterministicHashSet::default();
+        let mut active = FastDeterministicHashSet::default();
+        let mut work = vec![ExplanationStep::Enter(u, v)];
+        let mut final_proof = Vec::new();
+        let mut in_proof = FastDeterministicHashSet::default();
+        while let Some(step) = work.pop() {
+            let (a, b) = match step {
+                ExplanationStep::Enter(a, b) => (a, b),
+                ExplanationStep::Finish(key) => {
+                    active.remove(&key);
+                    done.insert(key);
+                    continue;
+                }
+            };
             let key = if a < b { (a, b) } else { (b, a) };
-            if !done.insert(key) {
+            if done.contains(&key) {
                 continue;
             }
-            match self.leastcommonancestor_helper(a, b, 0) {
-                None if first => return None,
-                None => {}
-                Some((equalities, pairs)) => {
-                    for e in equalities {
-                        if in_proof.insert(e) {
-                            final_proof.push(e);
-                        }
-                    }
-                    work.extend(pairs);
+            assert!(
+                active.insert(key),
+                "circular congruence explanation for {key:?}"
+            );
+            let Some(path) = self.leastcommonancestor_helper(a, b) else {
+                // Unrelated terms are a normal query result. A congruence
+                // dependency between unrelated terms is a malformed proof.
+                assert!(
+                    active.len() == 1,
+                    "unexplained congruence dependency {key:?}"
+                );
+                return None;
+            };
+            for e in path.equalities {
+                if in_proof.insert(e) {
+                    final_proof.push(e);
                 }
             }
-            first = false;
+            work.push(ExplanationStep::Finish(key));
+            // Reverse the push order to preserve the former recursive DFS
+            // order while expanding each completed pair only once.
+            work.extend(
+                path.congruences
+                    .into_iter()
+                    .rev()
+                    .map(|(a, b)| ExplanationStep::Enter(a, b)),
+            );
         }
         Some(final_proof)
     }
@@ -776,16 +809,10 @@ impl Egraph {
     /// proof-forest paths to their least common ancestor, and the argument
     /// pairs of the congruence edges on those paths, which the caller
     /// explains in turn. `None` when `u` and `v` are not in one class.
-    #[allow(clippy::type_complexity)]
-    fn leastcommonancestor_helper(
-        &self,
-        u: u32,
-        v: u32,
-        indent: usize,
-    ) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
+    fn leastcommonancestor_helper(&self, u: u32, v: u32) -> Option<PathExplanation> {
         debug_println!(
             20,
-            indent,
+            0,
             "checking the equality of {} and {}",
             self.display_term(u),
             self.display_term(v)
@@ -795,13 +822,8 @@ impl Egraph {
         let mut path_from_u: Vec<u32> = vec![];
         let mut curr = u;
 
-        let max_recursion_depth = 100;
-        if indent > max_recursion_depth {
-            debug_println!(11, 0, "We have the proof forest :{}", self);
-            panic!("Should not have this many recursive calls to LCH");
-        }
         loop {
-            visited.insert(curr);
+            assert!(visited.insert(curr), "circular proof-forest parent chain");
             if let ProofForestEdge::Root { .. } = self.proof_forest[curr as usize] {
                 break;
             }
@@ -811,7 +833,12 @@ impl Egraph {
 
         let mut path_from_v: Vec<u32> = vec![];
         curr = v;
+        let mut visited_from_v = FastDeterministicHashSet::default();
         loop {
+            assert!(
+                visited_from_v.insert(curr),
+                "circular proof-forest parent chain"
+            );
             if visited.contains(&curr) {
                 break;
             }
@@ -833,7 +860,7 @@ impl Egraph {
             .take_while(|&&node| node != lca)
             .chain(path_from_v.iter());
 
-        debug_println!(16, indent + 1, "We have the proof:");
+        debug_println!(16, 1, "We have the proof:");
         for &node in proof_nodes {
             match &self.proof_forest[node as usize] {
                 ProofForestEdge::Root { .. } => {
@@ -842,11 +869,11 @@ impl Egraph {
                 }
                 ProofForestEdge::Congruence { pairs, .. } => {
                     if is_important(20) {
-                        debug_println!(20, indent + 12, "Congruence ");
+                        debug_println!(20, 12, "Congruence ");
                         for &(t1, t2) in pairs.iter() {
                             debug_println!(
                                 20,
-                                indent + 12,
+                                12,
                                 "{} [{}] ~ {} [{}] ",
                                 self.display_term(t1),
                                 t1,
@@ -861,7 +888,7 @@ impl Egraph {
                     if let Some(&(t1, t2)) = term.as_ref() {
                         debug_println!(
                             20,
-                            indent + 12,
+                            12,
                             "Equality {} [{}] = {} [{}]",
                             self.display_term(t1),
                             t1,
@@ -881,7 +908,10 @@ impl Egraph {
         }
 
         let pending: Vec<(u32, u32)> = proof_congruences.into_iter().flatten().copied().collect();
-        Some((final_proof, pending))
+        Some(PathExplanation {
+            equalities: final_proof,
+            congruences: pending,
+        })
     }
 
     /// Assert t1 = t2 at the current decision level.
@@ -1833,5 +1863,118 @@ impl EgraphTrait for Egraph {
         t2: Self::TermId,
     ) -> Option<Vec<(Self::TermId, Self::TermId)>> {
         self.leastcommonancestor(t1, t2)
+    }
+}
+
+#[cfg(test)]
+mod explanation_regressions {
+    use super::*;
+
+    fn constant(e: &mut Egraph, name: &str) -> u32 {
+        e.register_term(Op::App(name.into()), &[], false)
+    }
+
+    fn corrupt_congruence(e: &mut Egraph, child: u32, parent: u32, pairs: Vec<(u32, u32)>) {
+        e.proof_forest[child as usize] = ProofForestEdge::Congruence {
+            pairs,
+            size: 1,
+            parent,
+            child,
+            disequalities: DeterministicHashMap::new(),
+            level: 0,
+            hash: e.predecessor_hash,
+            children: DeterministicHashSet::new(),
+        };
+    }
+
+    #[test]
+    #[should_panic(expected = "circular congruence explanation")]
+    fn rejects_reversed_self_dependency() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        corrupt_congruence(&mut e, a, b, vec![(b, a)]);
+        e.leastcommonancestor(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "circular congruence explanation")]
+    fn rejects_indirect_dependency_cycle() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        let c = constant(&mut e, "c");
+        let d = constant(&mut e, "d");
+        corrupt_congruence(&mut e, a, b, vec![(c, d)]);
+        corrupt_congruence(&mut e, c, d, vec![(a, b)]);
+        e.leastcommonancestor(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexplained congruence dependency")]
+    fn rejects_unequal_congruence_dependency() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        let c = constant(&mut e, "c");
+        let d = constant(&mut e, "d");
+        corrupt_congruence(&mut e, a, b, vec![(c, d)]);
+        e.leastcommonancestor(a, b);
+    }
+
+    #[test]
+    #[should_panic(expected = "circular proof-forest parent chain")]
+    fn rejects_parent_cycle() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        let c = constant(&mut e, "c");
+        corrupt_congruence(&mut e, a, b, vec![]);
+        corrupt_congruence(&mut e, b, a, vec![]);
+        // The cycle is on the second path, which never intersects c's path.
+        e.leastcommonancestor(c, a);
+    }
+
+    #[test]
+    fn shared_deep_proof_is_not_a_cycle() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        let (mut x, mut y) = (a, b);
+        for i in 0..150 {
+            x = e.register_term(Op::App(format!("f{i}")), &[x, x], false);
+            y = e.register_term(Op::App(format!("f{i}")), &[y, y], false);
+        }
+        assert!(e.assert_equal(a, b).conflict.is_none());
+        let explanation = e.leastcommonancestor(x, y).unwrap();
+        assert_eq!(explanation.len(), 1);
+        assert!(explanation[0] == (a, b) || explanation[0] == (b, a));
+    }
+
+    #[test]
+    fn seed_764_minimal() {
+        // Preserve the exact low-level sequence: a SAT regression alone cannot
+        // pin the decision levels and the duplicate assertion that exposed it.
+        let mut e = Egraph::new();
+        let c0 = constant(&mut e, "c0");
+        let c1 = constant(&mut e, "c1");
+        let c2 = constant(&mut e, "c2");
+        let c3 = constant(&mut e, "c3");
+        assert!(e.assert_equal(c2, c1).conflict.is_none());
+        let x = e.register_term(Op::App("f".into()), &[c3, c1], true);
+        let y = e.register_term(Op::App("g".into()), &[x], true);
+        e.backtrack_to(0);
+        assert!(e.assert_equal(c0, y).conflict.is_none());
+        assert!(e.assert_equal(c0, c2).conflict.is_none());
+        assert!(e.assert_disequal(c3, y, 1035).conflict.is_none());
+        e.notify_new_decision_level();
+        e.notify_new_decision_level();
+        assert!(e.assert_disequal(c1, c3, 1331).conflict.is_none());
+        e.backtrack_to(1);
+        let conflict = e
+            .assert_equal(y, c3)
+            .conflict
+            .expect("level-0 disequality must survive");
+        assert_eq!(conflict.diseq_lit, Some(1035));
     }
 }
