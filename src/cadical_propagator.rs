@@ -12,7 +12,8 @@ use crate::log::is_important;
 use crate::proof::{SMTProofTracer, Theory};
 use crate::quantifiers::quantifier::QuantifierInstance::{Instantiation, Skolemization};
 use crate::quantifiers::quantifier::{
-    PendingInstantiations, instantiate_quantifiers, materialize_next, INST_GEN_SKIPPED, qi_max_generation,
+    INST_GEN_SKIPPED, PendingInstantiations, instantiate_quantifiers, materialize_next,
+    qi_max_generation,
 };
 use crate::solver_state::{SolverState, process_assignment};
 use crate::stats::SolverStats;
@@ -363,11 +364,15 @@ impl<'a> CustomExternalPropagator<'a> {
         );
         if pending.is_empty() && allow_skolemization && bound.is_some() {
             self.stats.generation_fallbacks += 1;
-            // Iterative deepening (`SUNDANCE_QI_DEEPEN=1`): the next bound is
+            // Iterative deepening (on unless `SUNDANCE_QI_DEEPEN=0`): the next bound is
             // the smallest generation held back, so the chain is explored one
             // depth at a time; otherwise the retry is unbounded.
             let next = if crate::quantifiers::quantifier::qi_deepen() {
-                self.solver_state.gen_deferred.iter().map(|d| d.generation).min()
+                self.solver_state
+                    .gen_deferred
+                    .iter()
+                    .map(|d| d.generation)
+                    .min()
             } else {
                 None
             };

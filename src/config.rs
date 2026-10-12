@@ -52,9 +52,11 @@ pub struct Args {
     /// `qi.eager_threshold` with the default cost): an input term has
     /// generation 0, an instance one more than the largest generation among
     /// its bindings. A match above the bound is left for a later round; the
-    /// complete-model round retries when nothing is below it. 0 (default) is
-    /// unbounded. Same as SUNDANCE_QI_MAX_GEN=<n>.
-    #[arg(long, default_value_t = 0)]
+    /// complete-model round retries when nothing is below it, raising the
+    /// bound one generation at a time. Default 5 (Z3's default threshold);
+    /// 0 is unbounded. Same as `SUNDANCE_QI_MAX_GEN=<n>`, which takes precedence
+    /// when set.
+    #[arg(long, default_value_t = 5)]
     pub max_generation: u32,
     /// Infer triggers for `forall` quantifiers that lack a `:pattern` annotation
     /// (Simplify/Z3-style auto-trigger inference). When off (default), an
