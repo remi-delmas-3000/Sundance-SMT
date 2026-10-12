@@ -31,6 +31,9 @@ fn main() -> Result<(), String> {
     // variables keep working on their own.
     // SAFETY (env mutation): single-threaded startup, before any reader.
     unsafe {
+        if args.ac {
+            std::env::set_var("SUNDANCE_AC", "1");
+        }
         if args.incremental_matching {
             std::env::set_var("SUNDANCE_INCR_MATCH", "1");
         }
