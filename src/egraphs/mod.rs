@@ -4,6 +4,8 @@
 pub mod basic;
 #[cfg(test)]
 mod conformance;
+#[cfg(feature = "semper-egraph")]
+pub mod semper;
 pub mod traits;
 
 /// Trail-boundary profile, symmetric across backends: wall spent inside the

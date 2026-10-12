@@ -30,7 +30,14 @@ fn main() -> Result<(), String> {
     // exported here, before any solver state is built. The environment
     // variables keep working on their own.
     // SAFETY (env mutation): single-threaded startup, before any reader.
+    // Store-kind lever for the semper e-graph backend: read once at first
+    // cache construction, so export before any engine is built.
+    // SAFETY (env mutation): single-threaded startup, before any reader.
+    unsafe { std::env::set_var("SEMPER_DIFF", &args.diff_mode) };
     unsafe {
+        if args.native_ematch {
+            std::env::set_var("SEMPER_NATIVE_EMATCH", "1");
+        }
         if args.ac {
             std::env::set_var("SUNDANCE_AC", "1");
         }

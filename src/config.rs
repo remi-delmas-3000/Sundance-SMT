@@ -35,6 +35,12 @@ pub struct Args {
     #[cfg_attr(feature = "z3-solver", arg(long, default_value_t = ArithSolver::Z3Incremental, value_enum))]
     #[cfg_attr(not(feature = "z3-solver"), arg(long, default_value_t = ArithSolver::Internal, value_enum))]
     pub arithmetic: ArithSolver,
+    /// Diff store for the semper e-graph's node-cache columns: "inline" or
+    /// "parallel" (frame diffs, first-write-wins capture) or "trail"
+    /// (chronological capture, branch-free writes). Only meaningful with the
+    /// semper-egraph backend; exported as SEMPER_DIFF before construction.
+    #[arg(long, default_value = "inline", value_parser = ["inline", "parallel", "trail"])]
+    pub diff_mode: String,
     /// Turns on lazy datatype instantiation for certain axioms
     #[arg(long, default_value_t = true)]
     pub lazy_dt: bool,
@@ -48,7 +54,12 @@ pub struct Args {
     /// A negative value exhausts one fresh matching round per level; 0 disables eager QI.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     pub eager_qi: i32,
-    /// Relevancy filtering of e-matching and instantiation : `off` (default), `final` (the complete-model matching round is
+    /// Term-layer AC: flatten, sort and deduplicate `and`/`or` children in
+    /// preprocessing (same as SUNDANCE_AC=1). Off by default.
+    #[arg(long, default_value_t = false)]
+    pub ac: bool,
+    /// Relevancy filtering of e-matching and instantiation (semper e-graph
+    /// only): `off` (default), `final` (the complete-model matching round is
     /// filtered, with an unfiltered retry when it yields nothing), or `eager`
     /// (eager matching rounds at every decision level, filtered).
     #[arg(long, default_value = "off", value_parser = ["off", "final", "eager"])]
@@ -63,16 +74,16 @@ pub struct Args {
     /// when set.
     #[arg(long, default_value_t = 5)]
     pub max_generation: u32,
-    /// Term-layer AC: flatten, sort and deduplicate `and`/`or` children in
-    /// preprocessing (same as SUNDANCE_AC=1). Off by default.
-    #[arg(long, default_value_t = false)]
-    pub ac: bool,
-    /// Incremental e-matching (top-down matcher): a round
+    /// Incremental e-matching (semper e-graph, top-down matcher): a round
     /// matches only at root candidates whose class, or a class below it
     /// within the pattern's depth, changed since the previous round. Same as
     /// SUNDANCE_INCR_MATCH=1. Off by default.
     #[arg(long, default_value_t = false)]
     pub incremental_matching: bool,
+    /// Native (engine) e-matching instead of the top-down matcher (semper
+    /// e-graph only; same as SEMPER_NATIVE_EMATCH=1). Off by default.
+    #[arg(long, default_value_t = false)]
+    pub native_ematch: bool,
     /// Infer triggers for `forall` quantifiers that lack a `:pattern` annotation
     /// (Simplify/Z3-style auto-trigger inference). When off (default), an
     /// untriggered `forall` panics instead.

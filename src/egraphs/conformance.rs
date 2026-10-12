@@ -1172,3 +1172,158 @@ mod basic {
         super::backtrack_restores_classes(Egraph::new)
     }
 }
+
+// --- The semper e-graph against the sundance e-graph --------------------------
+
+#[cfg(feature = "semper-egraph")]
+#[test]
+fn differential_basic_against_semper() {
+    let only: Option<u64> = std::env::var("CONFORMANCE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    for seed in 1..=seeds(60) {
+        if only.is_some_and(|o| o != seed) {
+            continue;
+        }
+        let calls = calls_of(&random_script(seed, 50));
+        if let Some(d) = diff_backends(
+            crate::egraphs::Egraph::new,
+            crate::egraphs::semper::SemperEgraph::new,
+            &calls,
+        ) {
+            panic!("seed {seed}: basic and semper diverge at {d}");
+        }
+    }
+}
+
+#[cfg(feature = "semper-egraph")]
+fn minimize(mut calls: Vec<Call>) -> Vec<Call> {
+    let diverges = |c: &[Call]| {
+        diff_backends(
+            crate::egraphs::Egraph::new,
+            crate::egraphs::semper::SemperEgraph::new,
+            c,
+        )
+        .is_some()
+    };
+    assert!(diverges(&calls));
+    loop {
+        let mut shrunk = false;
+        for i in (0..calls.len()).rev() {
+            // Index of the registration removed, if call i is one.
+            let reg_index = calls[..i]
+                .iter()
+                .filter(|c| matches!(c, Call::Term(..)))
+                .count() as u32;
+            let is_term = matches!(calls[i], Call::Term(..));
+            if is_term {
+                let referenced = calls[i + 1..].iter().any(|c| match c {
+                    Call::Term(_, ch) => ch.contains(&reg_index),
+                    Call::Eq(a, b) | Call::Neq(a, b, _) => *a == reg_index || *b == reg_index,
+                    _ => false,
+                });
+                if referenced {
+                    continue;
+                }
+            }
+            let mut cand: Vec<Call> = calls.clone();
+            cand.remove(i);
+            if is_term {
+                let shift = |x: &mut u32| {
+                    if *x > reg_index {
+                        *x -= 1;
+                    }
+                };
+                for c in cand.iter_mut() {
+                    match c {
+                        Call::Term(_, ch) => ch.iter_mut().for_each(shift),
+                        Call::Eq(a, b) | Call::Neq(a, b, _) => {
+                            shift(a);
+                            shift(b);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if diverges(&cand) {
+                calls = cand;
+                shrunk = true;
+            }
+        }
+        if !shrunk {
+            return calls;
+        }
+    }
+}
+
+#[cfg(feature = "semper-egraph")]
+#[test]
+#[ignore = "diagnostic: shrinks a diverging seed of differential_basic_against_semper"]
+fn minimize_divergence() {
+    let seed: u64 = std::env::var("CONFORMANCE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(764);
+    let calls = calls_of(&random_script(seed, 50));
+    let min = minimize(calls);
+    let d = diff_backends(
+        crate::egraphs::Egraph::new,
+        crate::egraphs::semper::SemperEgraph::new,
+        &min,
+    )
+    .expect("still diverges");
+    eprintln!("minimal divergence ({} calls): {d}", min.len());
+    for (i, c) in min.iter().enumerate() {
+        eprintln!("{i}: {c:?}");
+    }
+}
+
+#[cfg(feature = "semper-egraph")]
+mod semper {
+    use crate::egraphs::semper::SemperEgraph;
+    t!(ids_survive_backtrack, SemperEgraph::new());
+    t!(congruent_registration_merges_now, SemperEgraph::new());
+    t!(eq_is_commutative, SemperEgraph::new());
+    t!(
+        distinct_literals_conflict,
+        SemperEgraph::new(),
+        ignore = "the semper adapter merges two different literal values without a conflict"
+    );
+    t!(true_false_collision, SemperEgraph::new());
+    t!(disequal_on_equal_conflicts_now, SemperEgraph::new());
+    t!(congruence_conflict_is_valid, SemperEgraph::new());
+    t!(explanation_complete_canonical_children, SemperEgraph::new());
+    t!(
+        explanation_complete_hashcons_onto_creator,
+        SemperEgraph::new()
+    );
+    t!(explain_equality_complete_any_pair, SemperEgraph::new());
+    t!(level0_disequality_survives_backtracks, SemperEgraph::new());
+    t!(disequality_survives_popped_duplicate, SemperEgraph::new());
+    t!(seed_764_minimal, SemperEgraph::new());
+    t!(
+        disequality_survives_popped_reversed_duplicate,
+        SemperEgraph::new()
+    );
+    t!(
+        level0_disequality_survives_backtracks_plain,
+        SemperEgraph::new()
+    );
+    t!(drain_reports_equal_arithmetic_terms, SemperEgraph::new());
+    t!(drain_rereports_after_backtrack, SemperEgraph::new());
+    t!(rooted_union_equals_unrooted, SemperEgraph::new());
+    t!(bindings_stable_across_root_changes, SemperEgraph::new());
+    t!(inactive_relevancy_filters_nothing, SemperEgraph::new());
+    #[test]
+    fn disequality_after_backtrack_survives_popped_duplicate() {
+        super::disequality_after_backtrack_survives_popped_duplicate(SemperEgraph::new)
+    }
+    #[test]
+    fn random_conflicts_are_valid() {
+        super::random_conflicts_are_valid(SemperEgraph::new)
+    }
+    #[test]
+    fn backtrack_restores_classes() {
+        super::backtrack_restores_classes(SemperEgraph::new)
+    }
+}
