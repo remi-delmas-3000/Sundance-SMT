@@ -48,6 +48,14 @@ pub struct Args {
     /// A negative value exhausts one fresh matching round per level; 0 disables eager QI.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     pub eager_qi: i32,
+    /// Bound on the generation of quantifier instances (Z3's
+    /// `qi.eager_threshold` with the default cost): an input term has
+    /// generation 0, an instance one more than the largest generation among
+    /// its bindings. A match above the bound is left for a later round; the
+    /// complete-model round retries when nothing is below it. 0 (default) is
+    /// unbounded. Same as SUNDANCE_QI_MAX_GEN=<n>.
+    #[arg(long, default_value_t = 0)]
+    pub max_generation: u32,
     /// Infer triggers for `forall` quantifiers that lack a `:pattern` annotation
     /// (Simplify/Z3-style auto-trigger inference). When off (default), an
     /// untriggered `forall` panics instead.

@@ -130,6 +130,17 @@ pub struct SolverState {
 
     /// Tracks quantifier instantiations to avoid duplicates.
     pub added_instantiations: HashMap<u64, HashSet<DeterministicHashMap<Local, Term>>>,
+    /// Generation of each term created by a quantifier instance, by solver
+    /// uid (Z3's enode generation): the instance's generation, itself one
+    /// more than the largest generation among its bindings. A term absent
+    /// here is an input term, generation 0; a hash-consed term keeps the
+    /// generation of its first creation. Read by the instantiation bound
+    /// (`SUNDANCE_QI_MAX_GEN`).
+    pub term_generation: HashMap<u64, u32>,
+    /// Matches held back by the generation bound, and their keys (quantifier
+    /// id, substitution) so a match is held once.
+    pub gen_deferred: Vec<crate::quantifiers::quantifier::GenDeferred>,
+    pub gen_deferred_keys: HashMap<u64, HashSet<DeterministicHashMap<Local, Term>>>,
 
     /// Precomputed datatype constructor/selector info.
     pub datatype_info: DatatypeInfo,
@@ -198,6 +209,9 @@ impl SolverState {
             assertions: vec![],
             quantifiers: vec![],
             added_instantiations: HashMap::default(),
+            term_generation: HashMap::default(),
+            gen_deferred: Vec::new(),
+            gen_deferred_keys: HashMap::default(),
             datatype_info,
             term_constructors: DeterministicHashMap::new(),
             nelson_oppen_ineq_literals: HashSet::new(),
