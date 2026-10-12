@@ -58,7 +58,11 @@ pub(crate) static INST_GEN_SKIPPED: std::sync::atomic::AtomicU64 =
 
 /// Generation of the term bound to a variable: 0 for an input term.
 fn term_generation(solver_state: &SolverState, t: &Term) -> u32 {
-    solver_state.term_generation.get(&t.uid()).copied().unwrap_or(0)
+    solver_state
+        .term_generation
+        .get(&t.uid())
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Give every subterm of `term` that has no generation yet the generation
@@ -75,7 +79,10 @@ fn tag_generation(solver_state: &mut SolverState, term: &Term, g: u32) {
 }
 
 fn fmt_subs(subs: &DeterministicHashMap<Local, Term>) -> String {
-    let mut kv: Vec<String> = subs.iter().map(|(k, v)| format!("{}->{v}", k.symbol)).collect();
+    let mut kv: Vec<String> = subs
+        .iter()
+        .map(|(k, v)| format!("{}->{v}", k.symbol))
+        .collect();
     kv.sort();
     kv.join(", ")
 }
@@ -95,30 +102,33 @@ struct DeferredInstantiation {
     generation: u32,
     /// Usefulness under the assignment the round saw (`qi_priority`): 0 the
     /// body is already false (a conflict), 1 unit (one atom undetermined),
-    /// 2 otherwise. Orders materialization when `SUNDANCE_QI_TRIAGE=1`.
+    /// 2 otherwise. Orders materialization unless `SUNDANCE_QI_TRIAGE=0`.
     priority: u8,
 }
 
-/// `SUNDANCE_QI_SORT=1`: materialize a round's instances in generation
-/// order (shallowest first), so a `--batch-cap` is breadth-first too.
+/// Materialize a round's instances in generation order (shallowest first),
+/// so a `--batch-cap` is breadth-first too. On by default;
+/// `SUNDANCE_QI_SORT=0` turns it off.
 pub(crate) fn qi_sort() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_SORT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_SORT").map_or(true, |v| v != "0"))
 }
-/// `SUNDANCE_QI_TRIAGE=1`: conflicting instances first, unit next, the
-/// rest by generation (cvc5's conflict-based instantiation as an ordering).
+/// Conflicting instances first, unit next, the rest by generation (cvc5's
+/// conflict-based instantiation as an ordering). On by default;
+/// `SUNDANCE_QI_TRIAGE=0` turns it off.
 pub(crate) fn qi_triage() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_TRIAGE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_TRIAGE").map_or(true, |v| v != "0"))
 }
-/// `SUNDANCE_QI_DEEPEN=1`: when nothing at or below the generation bound is
+/// On by default (`SUNDANCE_QI_DEEPEN=0` turns it off): when nothing at or
+/// below the generation bound is
 /// left, the complete-model round raises the bound to the smallest held
 /// generation instead of dropping it (iterative deepening of the instance
 /// chain), so a matching loop at depth 300 does not re-enter the moment the
 /// shallow instances are exhausted.
 pub(crate) fn qi_deepen() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_DEEPEN").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("SUNDANCE_QI_DEEPEN").map_or(true, |v| v != "0"))
 }
 
 /// Three-valued value of `t` under the current assignment and e-graph, and
@@ -132,7 +142,11 @@ fn eval3(t: &Term, solver_state: &SolverState, assignments: &[i32]) -> (Option<b
     let lit_val = |t: &Term| -> Option<bool> {
         let l = solver_state.get_lit_from_term_safe(t)?;
         let v = *assignments.get(l.unsigned_abs() as usize)?;
-        if v == 0 { None } else { Some((v > 0) == (l > 0)) }
+        if v == 0 {
+            None
+        } else {
+            Some((v > 0) == (l > 0))
+        }
     };
     match t.repr() {
         ATerm::Constant(AConstant::Bool(b), _) => (Some(*b), 0),
@@ -379,8 +393,10 @@ pub(crate) fn instantiate_quantifiers(
                 // The ground check (`instance_check.py`) declares these
                 // constants and asserts the clause sundance adds:
                 // exists: (=> Q skolem); forall: (=> (not Q) skolem).
-                let decls: Vec<String> =
-                    skolem_vars.iter().map(|(n, s)| format!("{n}:{s}")).collect();
+                let decls: Vec<String> = skolem_vars
+                    .iter()
+                    .map(|(n, s)| format!("{n}:{s}"))
+                    .collect();
                 eprintln!(
                     "INST-SK q={} exists={} decls=[{}] qterm={} skolem={}",
                     quantifier.id,
@@ -488,8 +504,11 @@ pub(crate) fn instantiate_quantifiers(
 
                 // Checked before the dedup records the match, so a bounded
                 // round leaves the match for a later round at a higher bound.
-                let generation =
-                    1 + subs.values().map(|t| term_generation(solver_state, t)).max().unwrap_or(0);
+                let generation = 1 + subs
+                    .values()
+                    .map(|t| term_generation(solver_state, t))
+                    .max()
+                    .unwrap_or(0);
                 if let Some(bound) = max_generation
                     && generation > bound
                 {
@@ -569,13 +588,25 @@ pub(crate) fn instantiate_quantifiers(
         // Stable: ties keep the matcher's order.
         let triage = qi_triage();
         let sort = qi_sort();
-        deferred_instantiations
-            .make_contiguous()
-            .sort_by_key(|d| (if triage { d.priority } else { 0 }, if sort { d.generation } else { 0 }));
+        deferred_instantiations.make_contiguous().sort_by_key(|d| {
+            (
+                if triage { d.priority } else { 0 },
+                if sort { d.generation } else { 0 },
+            )
+        });
         if inst_trace() {
-            let c = deferred_instantiations.iter().filter(|d| d.priority == 0).count();
-            let u = deferred_instantiations.iter().filter(|d| d.priority == 1).count();
-            eprintln!("INST-TRIAGE r={round} conflicting={c} unit={u} other={}", deferred_instantiations.len() - c - u);
+            let c = deferred_instantiations
+                .iter()
+                .filter(|d| d.priority == 0)
+                .count();
+            let u = deferred_instantiations
+                .iter()
+                .filter(|d| d.priority == 1)
+                .count();
+            eprintln!(
+                "INST-TRIAGE r={round} conflicting={c} unit={u} other={}",
+                deferred_instantiations.len() - c - u
+            );
         }
     }
     PendingInstantiations {

@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     // The flag sets the environment switch the quantifier module reads (a
     // cached reader, so it must be exported before any solver state is built).
     // SAFETY (env mutation): single-threaded startup, before any reader.
-    if args.max_generation > 0 {
+    if std::env::var_os("SUNDANCE_QI_MAX_GEN").is_none() {
         unsafe { std::env::set_var("SUNDANCE_QI_MAX_GEN", args.max_generation.to_string()) };
     }
 
