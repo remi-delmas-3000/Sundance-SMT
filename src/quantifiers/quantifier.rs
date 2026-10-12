@@ -220,12 +220,14 @@ fn eval3(t: &Term, solver_state: &SolverState, assignments: &[i32]) -> (Option<b
     }
 }
 
-fn qi_priority(t: &Term, solver_state: &SolverState, assignments: &[i32]) -> u8 {
+fn qi_priority(t: &Term, is_exists: bool, solver_state: &SolverState, assignments: &[i32]) -> u8 {
     if !qi_triage() {
         return 2;
     }
+    // Existential instantiation emits the negated body during materialization.
+    // Evaluate that effective polarity when prioritizing conflicts.
     match eval3(t, solver_state, assignments) {
-        (Some(false), _) => 0,
+        (Some(value), _) if value == is_exists => 0,
         (None, 1) => 1,
         _ => 2,
     }
@@ -343,7 +345,7 @@ pub(crate) fn instantiate_quantifiers(
                 d.quantifier_id, d.generation
             );
         }
-        let priority = qi_priority(&substituted_term, solver_state, assignments);
+        let priority = qi_priority(&substituted_term, d.is_exists, solver_state, assignments);
         deferred_instantiations.push_back(DeferredInstantiation {
             substituted_term,
             is_exists: d.is_exists,
@@ -571,7 +573,12 @@ pub(crate) fn instantiate_quantifiers(
                         quantifier.id
                     );
                 }
-                let priority = qi_priority(&substituted_term, solver_state, assignments);
+                let priority = qi_priority(
+                    &substituted_term,
+                    quantifier_is_exists,
+                    solver_state,
+                    assignments,
+                );
                 deferred_instantiations.push_back(DeferredInstantiation {
                     substituted_term,
                     is_exists: quantifier_is_exists,
@@ -836,4 +843,22 @@ fn process_deferred_instantiations(
         results.push(QuantifierInstance::Instantiation { clauses });
     }
     results
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+    use yaspar_ir::ast::{Context, ObjectAllocatorExt};
+
+    #[test]
+    fn triage_uses_emitted_instance_polarity() {
+        let mut state = SolverState::new(Context::default(), false, false, false, false);
+        let t = state.context.get_true();
+        let f = state.context.get_false();
+        // Universals emit the body; negative existentials emit its negation.
+        assert_eq!(qi_priority(&f, false, &state, &[]), 0);
+        assert_eq!(qi_priority(&t, false, &state, &[]), 2);
+        assert_eq!(qi_priority(&t, true, &state, &[]), 0);
+        assert_eq!(qi_priority(&f, true, &state, &[]), 2);
+    }
 }
