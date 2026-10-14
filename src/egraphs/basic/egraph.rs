@@ -219,19 +219,15 @@ pub struct Egraph {
     /// the current decision level of the SAT solver, useful to keep track for backtracking
     decision_level: usize,
     /// keeps track of terms created by quantifier instantiation and their predecessors.
-    /// Inner map: parent term id -> decision level at which the (child, parent) pair
-    /// was registered. Used by `backtrack_to` to skip re-registering entries that
-    /// were added at or below the target level (their predecessors are already
-    /// valid at that level and don't need refreshing).
-    /// Per decision level: the (child, parent) pairs registered at that
-    /// level, so a backtrack visits only the levels it undoes instead of
-    /// cloning and scanning every entry (18% of the samples on
-    /// PagedBetreeRefinement_v.25 before this change).
+    /// Per decision level: the (child, parent) pairs registered at that level.
+    /// `backtrack_to` re-registers only the pairs of the levels it undoes; the
+    /// predecessors of the others are still valid at the target level. Keeping
+    /// them per level avoids cloning and scanning every entry on each backtrack
+    /// (18% of the samples on PagedBetreeRefinement_v.25 before this change).
     predecessors_created_by_quantifiers: Vec<Vec<(u32, u32)>>,
     /// if a quantifier instantiates (f t) and t = s, then we want to add (f.uid(), "f", [t.uid()]).
-    /// Value is the decision level at which the term was registered; entries added
-    /// at or below the backtrack target level are skipped during `backtrack_to`.
     /// Per decision level: the dynamic terms registered at that level.
+    /// `backtrack_to` probes the sig table again only for the levels it undoes.
     union_to_eclass: Vec<Vec<u32>>,
     /// Signature table: maps (op, [find(c1),...,find(cn)]) → term_id.
     /// Maintained in parallel with the existing congruence detection for now.
