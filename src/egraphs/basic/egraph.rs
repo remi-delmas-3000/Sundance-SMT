@@ -256,6 +256,15 @@ pub(crate) struct EgraphStats {
     pub(crate) merges: u64,
 }
 
+/// What the proof-forest path between two terms of one class shows directly.
+struct PathExplanation {
+    /// The asserted equalities on the path.
+    equalities: Vec<(u32, u32)>,
+    /// The argument pairs of the congruence edges on the path, which need
+    /// explanations of their own.
+    congruence_pairs: Vec<(u32, u32)>,
+}
+
 impl Default for Egraph {
     fn default() -> Self {
         Self::new()
@@ -744,27 +753,66 @@ impl Egraph {
         // shared across the proof DAG. Recursing into them without a memo
         // explored the DAG as a tree (85% of the samples 27 levels deep on
         // PagedBetreeRefinement_v.25). Z3's explain_eq marks each pair.
-        let mut done: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
-        let mut work: Vec<(u32, u32)> = vec![(u, v)];
+        //
+        // The walk is a depth-first search that visits the argument pairs in
+        // order, so the equalities come out in the order of the former
+        // recursion, without its duplicates. A pair that is still open when it
+        // is needed again explains itself: the proof forest is broken and the
+        // conflict clause would be unsound, so that panics.
+        enum Step {
+            Explain(u32, u32),
+            Close((u32, u32)),
+        }
+        let mut explained: FastDeterministicHashSet<(u32, u32)> =
+            FastDeterministicHashSet::default();
+        let mut open: FastDeterministicHashSet<(u32, u32)> = FastDeterministicHashSet::default();
+        let mut work = vec![Step::Explain(u, v)];
         let mut final_proof: Vec<(u32, u32)> = Vec::new();
         let mut in_proof: FastDeterministicHashSet<(u32, u32)> =
             FastDeterministicHashSet::default();
         let mut first = true;
-        while let Some((a, b)) = work.pop() {
+        while let Some(step) = work.pop() {
+            let (a, b) = match step {
+                Step::Explain(a, b) => (a, b),
+                Step::Close(key) => {
+                    open.remove(&key);
+                    explained.insert(key);
+                    continue;
+                }
+            };
             let key = if a < b { (a, b) } else { (b, a) };
-            if !done.insert(key) {
+            if explained.contains(&key) {
                 continue;
             }
-            match self.leastcommonancestor_helper(a, b, 0) {
+            if !open.insert(key) {
+                debug_println!(11, 0, "We have the proof forest :{}", self);
+                panic!(
+                    "Circular explanation: explaining {} = {} needs {} = {} itself",
+                    self.display_term(u),
+                    self.display_term(v),
+                    self.display_term(a),
+                    self.display_term(b)
+                );
+            }
+            work.push(Step::Close(key));
+            match self.leastcommonancestor_helper(a, b, open.len()) {
                 None if first => return None,
                 None => {}
-                Some((equalities, pairs)) => {
+                Some(PathExplanation {
+                    equalities,
+                    congruence_pairs,
+                }) => {
                     for e in equalities {
                         if in_proof.insert(e) {
                             final_proof.push(e);
                         }
                     }
-                    work.extend(pairs);
+                    work.extend(
+                        congruence_pairs
+                            .into_iter()
+                            .rev()
+                            .map(|(x, y)| Step::Explain(x, y)),
+                    );
                 }
             }
             first = false;
@@ -772,17 +820,9 @@ impl Egraph {
         Some(final_proof)
     }
 
-    /// The path explanation of `u = v`: the asserted equalities along the
-    /// proof-forest paths to their least common ancestor, and the argument
-    /// pairs of the congruence edges on those paths, which the caller
-    /// explains in turn. `None` when `u` and `v` are not in one class.
-    #[allow(clippy::type_complexity)]
-    fn leastcommonancestor_helper(
-        &self,
-        u: u32,
-        v: u32,
-        indent: usize,
-    ) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
+    /// The path explanation of `u = v`, or `None` when `u` and `v` are not in
+    /// one class. The caller explains its congruence pairs in turn.
+    fn leastcommonancestor_helper(&self, u: u32, v: u32, indent: usize) -> Option<PathExplanation> {
         debug_println!(
             20,
             indent,
@@ -795,11 +835,6 @@ impl Egraph {
         let mut path_from_u: Vec<u32> = vec![];
         let mut curr = u;
 
-        let max_recursion_depth = 100;
-        if indent > max_recursion_depth {
-            debug_println!(11, 0, "We have the proof forest :{}", self);
-            panic!("Should not have this many recursive calls to LCH");
-        }
         loop {
             visited.insert(curr);
             if let ProofForestEdge::Root { .. } = self.proof_forest[curr as usize] {
@@ -880,8 +915,10 @@ impl Egraph {
             }
         }
 
-        let pending: Vec<(u32, u32)> = proof_congruences.into_iter().flatten().copied().collect();
-        Some((final_proof, pending))
+        Some(PathExplanation {
+            equalities: final_proof,
+            congruence_pairs: proof_congruences.into_iter().flatten().copied().collect(),
+        })
     }
 
     /// Assert t1 = t2 at the current decision level.
@@ -1833,5 +1870,68 @@ impl EgraphTrait for Egraph {
         t2: Self::TermId,
     ) -> Option<Vec<(Self::TermId, Self::TermId)>> {
         self.leastcommonancestor(t1, t2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn constant(e: &mut Egraph, name: &str) -> u32 {
+        e.register_term(Op::App(name.to_string()), &[], true)
+    }
+
+    fn app(e: &mut Egraph, f: &str, children: &[u32]) -> u32 {
+        e.register_term(Op::App(f.to_string()), children, true)
+    }
+
+    /// Reduced from seed 764 of the differential test between the basic and
+    /// semper e-graphs. The redundant backtrack at level 0 bumps the stamp
+    /// counter, so the level-0 disequality c3 != y carries a stamp above the
+    /// level's base stamp. The duplicate-insert rule took that for a popped
+    /// entry and let the level-2 disequality over the same classes replace it,
+    /// so the backtrack to 1 lost c3 != y and y = c3 raised no conflict.
+    #[test]
+    fn level0_disequality_survives_popped_duplicate_after_backtrack() {
+        let mut e = Egraph::new();
+        let c0 = constant(&mut e, "c0");
+        let c1 = constant(&mut e, "c1");
+        let c2 = constant(&mut e, "c2");
+        let c3 = constant(&mut e, "c3");
+        assert!(e.assert_equal(c2, c1).conflict.is_none());
+        let x = app(&mut e, "f", &[c3, c1]);
+        let y = app(&mut e, "g", &[x]);
+        e.backtrack_to(0);
+        assert!(e.assert_equal(c0, y).conflict.is_none());
+        assert!(e.assert_equal(c0, c2).conflict.is_none());
+        assert!(e.assert_disequal(c3, y, 1035).conflict.is_none());
+        e.notify_new_decision_level();
+        e.notify_new_decision_level();
+        assert!(e.assert_disequal(c1, c3, 1331).conflict.is_none());
+        e.backtrack_to(1);
+        let conflict = e
+            .assert_equal(y, c3)
+            .conflict
+            .expect("y = c3 contradicts the level-0 c3 != y");
+        assert_eq!(conflict.diseq_lit, Some(1035));
+    }
+
+    /// The argument pairs of a congruence edge are explained in argument
+    /// order, and an equality shared by several sub-proofs is cited once.
+    #[test]
+    fn explanation_is_in_argument_order_without_duplicates() {
+        let mut e = Egraph::new();
+        let a = constant(&mut e, "a");
+        let b = constant(&mut e, "b");
+        let c = constant(&mut e, "c");
+        let d = constant(&mut e, "d");
+        let fac = app(&mut e, "f", &[a, c]);
+        let fbd = app(&mut e, "f", &[b, d]);
+        let h1 = app(&mut e, "h", &[fac, c]);
+        let h2 = app(&mut e, "h", &[fbd, d]);
+        assert!(e.assert_equal(a, b).conflict.is_none());
+        assert!(e.assert_equal(c, d).conflict.is_none());
+        assert!(e.are_equal(h1, h2));
+        assert_eq!(e.explain_equality(h1, h2), Some(vec![(a, b), (c, d)]));
     }
 }
