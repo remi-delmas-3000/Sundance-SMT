@@ -16,7 +16,7 @@ use crate::arithmetic::lia::context::ConvContext;
 use crate::arithmetic::lia::linear_system::Rel;
 use crate::arithmetic::lia::qdelta::QDelta;
 use crate::arithmetic::lia::solver_result::{
-    Assignment, Conflict, SolverDecision, SolverError, SolverResult, SolverReturn,
+    Assignment, BoundRef, Conflict, SolverDecision, SolverError, SolverResult, SolverReturn,
 };
 use crate::arithmetic::lia::stats::Stats;
 use crate::arithmetic::lia::tableau::{Tableau, TableauImpl, TableauKind};
@@ -926,6 +926,15 @@ impl LRASolver {
 
     /// Perform the general simplex algorithm to find a feasible solution.
     pub fn solve(&mut self) -> SolverResult<SolverReturn> {
+        self.solve_with_bound_conflict().map(|(ret, _)| ret)
+    }
+
+    /// Like [`Self::solve`], but an infeasible result also returns the conflict as the set of
+    /// bounds it depends on, recording which side of each variable's bounds is involved. `None`
+    /// unless the decision is `INFEASIBLE`.
+    pub fn solve_with_bound_conflict(
+        &mut self,
+    ) -> SolverResult<(SolverReturn, Option<Conflict<BoundRef>>)> {
         self.num_simplex_steps = 0;
         loop {
             debug_println!(
@@ -952,7 +961,10 @@ impl LRASolver {
                         num_lra_solve: 1,
                         num_simplex_steps: self.num_simplex_steps,
                     };
-                    return Ok(SolverReturn::new(SolverDecision::FEASIBLE(assg), stats));
+                    return Ok((
+                        SolverReturn::new(SolverDecision::FEASIBLE(assg), stats),
+                        None,
+                    ));
                 }
                 Ok(SimplexStepResult::Infeasible(v)) => {
                     let conflict = self.compute_conflict(v)?;
@@ -966,9 +978,9 @@ impl LRASolver {
                         num_lra_solve: 1,
                         num_simplex_steps: self.num_simplex_steps,
                     };
-                    return Ok(SolverReturn::new(
-                        SolverDecision::INFEASIBLE(conflict),
-                        stats,
+                    return Ok((
+                        SolverReturn::new(SolverDecision::INFEASIBLE(conflict.vars()), stats),
+                        Some(conflict),
                     ));
                 }
                 Err(e) => return Err(e),
@@ -976,11 +988,18 @@ impl LRASolver {
         }
     }
 
-    /// If the solver is in an INFEASIBLE state, return a set of literals
-    /// that implies the conflict.
+    /// If the solver is in an INFEASIBLE state, return a set of bounds that implies the
+    /// conflict.
+    ///
+    /// `var` is a basic variable violating one of its bounds whose row admits no pivot. With
+    /// the row `var = sum_j a_j * x_j`, every non-basic `x_j` with `a_j != 0` sits at the bound
+    /// that blocks moving `var` back towards its violated bound, so the conflict is that bound
+    /// of `var` together with, for each `x_j`:
+    /// - `var` below its lower bound: `U(x_j)` if `a_j > 0`, `L(x_j)` if `a_j < 0`;
+    /// - `var` above its upper bound: `L(x_j)` if `a_j > 0`, `U(x_j)` if `a_j < 0`.
     ///
     /// The conflict produced is guaranteed to be minimal by Farkas' Lemma.
-    pub fn compute_conflict(&self, var: Var) -> SolverResult<Conflict<Var>> {
+    fn compute_conflict(&self, var: Var) -> SolverResult<Conflict<BoundRef>> {
         let var_info = &self.variables[*self.var_to_idx.get(&var).unwrap()];
         let row = match var_info.is_basic() {
             Some(r) => r,
@@ -990,13 +1009,22 @@ impl LRASolver {
                 ));
             }
         };
-        if var_info.below_lower() || var_info.above_upper() {
-            let mut conflicts = vec![var_info.var];
+        let below_lower = var_info.below_lower();
+        if below_lower || var_info.above_upper() {
+            let mut conflicts = vec![if below_lower {
+                BoundRef::lower(var_info.var)
+            } else {
+                BoundRef::upper(var_info.var)
+            }];
             for (col, non_basic_idx) in self.non_basic.iter().enumerate() {
                 let a_i_j = self.tableau.get(row, col).unwrap();
                 if a_i_j != &Rational::ZERO {
-                    let non_basic_var = &self.variables[*non_basic_idx];
-                    conflicts.push(non_basic_var.var);
+                    let non_basic_var = self.variables[*non_basic_idx].var;
+                    conflicts.push(if (a_i_j > &Rational::ZERO) == below_lower {
+                        BoundRef::upper(non_basic_var)
+                    } else {
+                        BoundRef::lower(non_basic_var)
+                    });
                 }
             }
             Ok(conflicts.into_iter().collect())
@@ -1054,8 +1082,12 @@ impl LRASolver {
             self.update(*col, rounded);
         }
 
-        // Check if all variables are still in bounds
-        let feasible = self.variables.iter().all(|v| v.in_bounds());
+        // Check if all variables are still in bounds, and that every integer variable (including
+        // basic ones recomputed from rational tableau coefficients) came out integral
+        let d0 = self.calculate_d0();
+        let feasible = self.variables.iter().all(|v| {
+            v.in_bounds() && (v.var.typ != VarType::Int || v.val.instantiate(&d0).is_int())
+        });
 
         if feasible {
             let assg = self.compute_assignment();
@@ -1145,8 +1177,16 @@ impl LRASolver {
         match ret.decision {
             SolverDecision::FEASIBLE(_) => {
                 let d0 = self.calculate_d0();
+                // Round the integer variables that were non-basic *before* this solve and
+                // recompute every other variable from the saved rows, so the assignment satisfies
+                // the tableau equations by construction. On a fresh tableau those non-basics are
+                // the structural variables, which is exactly what the unit cube argument rounds.
+                // Rounding basic variables independently is unsound once earlier pivots have
+                // moved structural variables into the basis (e.g. a solver reused incrementally):
+                // an independently rounded value can silently break its row.
                 let mut rounded_assignments = BTreeMap::new();
-                for v in self.variables.iter() {
+                for &idx in saved_non_basic.iter() {
+                    let v = &self.variables[idx];
                     let val = v.val.instantiate(&d0);
                     let rounded = if v.var.typ == VarType::Int {
                         let floor = Rational::from(val.floor());
@@ -1161,12 +1201,24 @@ impl LRASolver {
                     };
                     rounded_assignments.insert(v.var, rounded);
                 }
+                for (row, &idx) in saved_basic.iter().enumerate() {
+                    let mut val = Rational::ZERO;
+                    for (col, &nb_idx) in saved_non_basic.iter().enumerate() {
+                        let coeff = saved_tableau.get(row, col)?;
+                        if !coeff.is_zero() {
+                            val += coeff * &rounded_assignments[&self.variables[nb_idx].var];
+                        }
+                    }
+                    rounded_assignments.insert(self.variables[idx].var, val);
+                }
 
-                // Verify the rounded assignment satisfies all original bounds
+                // Verify the rounded assignment satisfies all original bounds and integrality
                 for v in self.variables.iter() {
                     let rounded_val = &rounded_assignments[&v.var];
                     let rounded_qdelta = QDelta::from(rounded_val.clone());
-                    if !v.bounds.in_bounds(&rounded_qdelta) {
+                    if !v.bounds.in_bounds(&rounded_qdelta)
+                        || (v.var.typ == VarType::Int && !rounded_val.is_int())
+                    {
                         self.state = LRASolverState::Unknown;
                         self.restore_tableau(
                             &saved_tableau,
