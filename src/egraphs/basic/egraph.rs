@@ -793,7 +793,18 @@ impl Egraph {
             work.push(Step::Close(key));
             match self.leastcommonancestor_helper(a, b, open.len()) {
                 None if first => return None,
-                None => {}
+                // A congruence edge whose arguments are not in one class: the
+                // conflict clause would miss the equalities behind that edge.
+                None => {
+                    debug_println!(11, 0, "We have the proof forest :{}", self);
+                    panic!(
+                        "Unexplained congruence: explaining {} = {} needs {} = {}, which are not in one class",
+                        self.display_term(u),
+                        self.display_term(v),
+                        self.display_term(a),
+                        self.display_term(b)
+                    );
+                }
                 Some(PathExplanation {
                     equalities,
                     congruence_pairs,
